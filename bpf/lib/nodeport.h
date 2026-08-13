@@ -750,6 +750,8 @@ int tail_nodeport_ipv6_dsr(struct __ctx_buff *ctx)
 			       (union v6addr *)&ip6->daddr);
 	}
 
+	fib_params_set_l4(&fib_params, ctx, ETH_HLEN);
+
 	ret = fib_redirect(ctx, true, &fib_params, false, &ext_err, &oif);
 	if (fib_ok(ret))
 		return ret;
@@ -1056,6 +1058,8 @@ fib_lookup:
 			       (union v6addr *)&ip6->daddr);
 	}
 
+	fib_params_set_l4(&fib_params, ctx, ETH_HLEN);
+
 #if (defined(ENABLE_EGRESS_GATEWAY_COMMON) && (defined(IS_BPF_XDP) || defined(IS_BPF_HOST))) ||	\
     defined(TUNNEL_MODE)
 fib_redirect:
@@ -1338,6 +1342,7 @@ fib_ipv4:
 	}
 
 	fib_params->l.ifindex = ctx_get_ifindex(ctx);
+	fib_params_set_l4(fib_params, ctx, ETH_HLEN);
 	ret = fib_redirect(ctx, true, fib_params, false, &ext_err, &oif);
 	if (fib_ok(ret))
 		return ret;
@@ -2315,6 +2320,9 @@ redirect:
 	}
 #endif
 
+	if (!tunnel_endpoint)
+		fib_params_set_l4(&fib_params, ctx, ETH_HLEN);
+
 	return fib_redirect(ctx, true, &fib_params, allow_neigh_map, ext_err, &ifindex);
 }
 
@@ -2581,6 +2589,8 @@ skip_source_lookup:
 
 	fib_params.l.ipv4_src = ip4->saddr;
 	fib_params.l.ipv4_dst = ip4->daddr;
+
+	fib_params_set_l4(&fib_params, ctx, ETH_HLEN);
 
 	ret = fib_redirect(ctx, true, &fib_params, false, &ext_err, &oif);
 	if (fib_ok(ret))
