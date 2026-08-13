@@ -10,6 +10,8 @@
 #include "network_device.h"
 #include "neigh.h"
 #include "l3.h"
+#include "l4.h"
+#include "jhash.h"
 
 static __always_inline bool
 neigh_resolver_without_nh_available()
@@ -238,6 +240,38 @@ fib_lookup_src_v6(struct __ctx_buff *ctx, struct in6_addr *src,
 	return fib_result;
 }
 
+#ifndef IPV6_FLOWLABEL_MASK
+#define IPV6_FLOWLABEL_MASK	bpf_htonl(0x000fffff)
+#endif
+
+/* Fill the lookup's flow keys (flow label and L4 ports) so a multipath
+ * FIB can select a per-flow nexthop. Lookup input only; the packet is
+ * not modified. When the packet carries no flow label, derive one from
+ * the ports so the default L3 hash policy can also spread flows.
+ */
+static __always_inline void
+fib_params_set_l4_v6(struct bpf_fib_lookup_padded *fib_params,
+		     struct __ctx_buff *ctx, const struct ipv6hdr *ip6,
+		     int l3_off)
+{
+	__be32 flowinfo = *(const __be32 *)ip6 & IPV6_FLOWLABEL_MASK;
+	__be16 ports[2];
+
+	if (l4_proto_has_ports(ip6->nexthdr) &&
+	    l4_load_ports(ctx, l3_off + sizeof(struct ipv6hdr), ports) == 0) {
+		fib_params->l.l4_protocol = ip6->nexthdr;
+		fib_params->l.sport = ports[0];
+		fib_params->l.dport = ports[1];
+
+		if (!flowinfo)
+			flowinfo = bpf_htonl(jhash_2words(ports[0], ports[1],
+							  JHASH_INITVAL)) &
+				   IPV6_FLOWLABEL_MASK;
+	}
+
+	fib_params->l.flowinfo = flowinfo;
+}
+
 static __always_inline int
 fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
 		struct ipv6hdr *ip6, const bool needs_l2_check,
@@ -252,6 +286,8 @@ fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
 		fib_params.l.tbid = tbid;
 		flags = (BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID);
 	}
+
+	fib_params_set_l4_v6(&fib_params, ctx, ip6, l3_off);
 
 	fib_result = fib_lookup_v6(ctx, &fib_params, &ip6->saddr, &ip6->daddr, flags);
 	switch (fib_result) {
@@ -320,6 +356,25 @@ fib_lookup_src_v4(struct __ctx_buff *ctx, __be32 *src, const __be32 dst)
 	return fib_result;
 }
 
+static __always_inline void
+fib_params_set_l4_v4(struct bpf_fib_lookup_padded *fib_params,
+		     struct __ctx_buff *ctx, const struct iphdr *ip4,
+		     int l3_off)
+{
+	__be16 ports[2];
+
+	/* No L4 header in non-first fragments. */
+	if (ip4->frag_off & bpf_htons(0x1fff))
+		return;
+
+	if (l4_proto_has_ports(ip4->protocol) &&
+	    l4_load_ports(ctx, l3_off + ipv4_hdrlen(ip4), ports) == 0) {
+		fib_params->l.l4_protocol = ip4->protocol;
+		fib_params->l.sport = ports[0];
+		fib_params->l.dport = ports[1];
+	}
+}
+
 static __always_inline int
 fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
 		struct iphdr *ip4, const bool needs_l2_check,
@@ -334,6 +389,8 @@ fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
 		fib_params.l.tbid = tbid;
 		flags = (BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID);
 	}
+
+	fib_params_set_l4_v4(&fib_params, ctx, ip4, l3_off);
 
 	fib_result = fib_lookup_v4(ctx, &fib_params, ip4->saddr, ip4->daddr, flags);
 	switch (fib_result) {
@@ -355,3 +412,31 @@ fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
 			       fib_result, *oif, ext_err);
 }
 #endif /* ENABLE_IPV4 */
+
+/* Variant for callers that pre-build fib_params: dissect the packet at
+ * l3_off according to the params' address family.
+ */
+static __always_inline void
+fib_params_set_l4(struct bpf_fib_lookup_padded *fib_params __maybe_unused,
+		  struct __ctx_buff *ctx __maybe_unused, int l3_off __maybe_unused)
+{
+	void *data __maybe_unused, *data_end __maybe_unused;
+
+#ifdef ENABLE_IPV4
+	if (fib_params->l.family == AF_INET) {
+		struct iphdr *ip4;
+
+		if (revalidate_data(ctx, &data, &data_end, &ip4))
+			fib_params_set_l4_v4(fib_params, ctx, ip4, l3_off);
+		return;
+	}
+#endif
+#ifdef ENABLE_IPV6
+	if (fib_params->l.family == AF_INET6) {
+		struct ipv6hdr *ip6;
+
+		if (revalidate_data(ctx, &data, &data_end, &ip6))
+			fib_params_set_l4_v6(fib_params, ctx, ip6, l3_off);
+	}
+#endif
+}

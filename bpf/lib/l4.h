@@ -16,6 +16,13 @@
 #define UDP_DPORT_OFF (offsetof(struct udphdr, dest))
 #define UDP_SPORT_OFF (offsetof(struct udphdr, source))
 
+/* Protocols whose L4 header starts with source and destination port. */
+static __always_inline bool l4_proto_has_ports(__u8 proto)
+{
+	return proto == IPPROTO_TCP || proto == IPPROTO_UDP ||
+	       proto == IPPROTO_SCTP;
+}
+
 union tcp_flags {
 	struct {
 		__u8 upper_bits;

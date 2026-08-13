@@ -6,6 +6,7 @@
 #define ENABLE_IPV6		      1
 #define SKIP_ICMPV6_HOPLIMIT_HANDLING 1
 #include "common.h"
+#include "pktgen.h"
 
 #define REDIR_NEIGH_ENTERED 1002
 
@@ -40,11 +41,19 @@ long mock_redirect_neigh(__maybe_unused int ifindex,
 
 struct fib_lookup_recorder {
 	__u32 flags;
+	__be32 flowinfo;
+	__be16 sport;
+	__be16 dport;
+	__u8 l4_protocol;
 } fib_lookup_recorder = {0};
 
 void reset_fib_lookup_recorder(struct fib_lookup_recorder *r)
 {
 	r->flags = 0;
+	r->flowinfo = 0;
+	r->sport = 0;
+	r->dport = 0;
+	r->l4_protocol = 0;
 }
 
 #define fib_lookup mock_fib_lookup
@@ -54,6 +63,10 @@ long mock_fib_lookup(void *ctx __maybe_unused,
 		     int plen __maybe_unused, __u32 flags __maybe_unused)
 {
 	fib_lookup_recorder.flags = flags;
+	fib_lookup_recorder.flowinfo = params->flowinfo;
+	fib_lookup_recorder.sport = params->sport;
+	fib_lookup_recorder.dport = params->dport;
+	fib_lookup_recorder.l4_protocol = params->l4_protocol;
 	return 0;
 }
 
@@ -235,6 +248,319 @@ int test2_check(struct __ctx_buff *ctx)
 				   fib_lookup_recorder.flags);
 
 		reset_fib_lookup_recorder(&fib_lookup_recorder);
+	});
+
+	test_finish();
+}
+
+PKTGEN(PROG_TYPE, "fib_flow_keys_v6_tcp")
+int fib_flow_keys_v6_tcp_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct ipv6hdr *l3;
+	struct tcphdr *l4;
+
+	pktgen__init(&builder, ctx);
+
+	l3 = pktgen__push_ipv6_packet(&builder,
+				      (__u8 *)mac_one, (__u8 *)mac_two,
+				      (__u8 *)v6_pod_one, (__u8 *)v6_pod_two);
+	if (!l3)
+		return TEST_ERROR;
+
+	l3->flow_lbl[0] = 0x01;
+	l3->flow_lbl[1] = 0x23;
+	l3->flow_lbl[2] = 0x45;
+
+	l4 = pktgen__push_default_tcphdr(&builder);
+	if (!l4)
+		return TEST_ERROR;
+
+	l4->source = tcp_src_one;
+	l4->dest = tcp_svc_one;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+CHECK(PROG_TYPE, "fib_flow_keys_v6_tcp")
+int fib_flow_keys_v6_tcp_check(struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
+	int oif = 0;
+	__s8 ext_err;
+
+	test_init();
+
+	TEST("label_and_ports", {
+		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+			test_fatal("packet too short");
+
+		reset_fib_lookup_recorder(&fib_lookup_recorder);
+		fib_redirect_v6(ctx, ETH_HLEN, ip6, false, true, &ext_err, &oif, 0);
+
+		if (fib_lookup_recorder.l4_protocol != IPPROTO_TCP)
+			test_fatal("l4_protocol not TCP");
+		if (fib_lookup_recorder.sport != tcp_src_one)
+			test_fatal("sport not set");
+		if (fib_lookup_recorder.dport != tcp_svc_one)
+			test_fatal("dport not set");
+		if (fib_lookup_recorder.flowinfo != bpf_htonl(0x12345))
+			test_fatal("packet flow label not used");
+	});
+
+	test_finish();
+}
+
+PKTGEN(PROG_TYPE, "fib_flow_keys_v6_udp")
+int fib_flow_keys_v6_udp_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct udphdr *l4;
+
+	pktgen__init(&builder, ctx);
+
+	l4 = pktgen__push_ipv6_udp_packet(&builder,
+					  (__u8 *)mac_one, (__u8 *)mac_two,
+					  (__u8 *)v6_pod_one, (__u8 *)v6_pod_two,
+					  tcp_src_one, tcp_svc_one);
+	if (!l4)
+		return TEST_ERROR;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+CHECK(PROG_TYPE, "fib_flow_keys_v6_udp")
+int fib_flow_keys_v6_udp_check(struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
+	int oif = 0;
+	__s8 ext_err;
+
+	test_init();
+
+	TEST("synthesized_label", {
+		__be32 expect = bpf_htonl(jhash_2words(tcp_src_one, tcp_svc_one,
+						       JHASH_INITVAL)) &
+				IPV6_FLOWLABEL_MASK;
+
+		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+			test_fatal("packet too short");
+
+		reset_fib_lookup_recorder(&fib_lookup_recorder);
+		fib_redirect_v6(ctx, ETH_HLEN, ip6, false, true, &ext_err, &oif, 0);
+
+		if (fib_lookup_recorder.l4_protocol != IPPROTO_UDP)
+			test_fatal("l4_protocol not UDP");
+		if (fib_lookup_recorder.sport != tcp_src_one)
+			test_fatal("sport not set");
+		if (fib_lookup_recorder.dport != tcp_svc_one)
+			test_fatal("dport not set");
+		if (!fib_lookup_recorder.flowinfo)
+			test_fatal("no label synthesized for label-less flow");
+		if (fib_lookup_recorder.flowinfo & ~IPV6_FLOWLABEL_MASK)
+			test_fatal("synthesized label exceeds the label bits");
+		if (fib_lookup_recorder.flowinfo != expect)
+			test_fatal("synthesized label not derived from ports");
+	});
+
+	test_finish();
+}
+
+PKTGEN(PROG_TYPE, "fib_flow_keys_v6_icmp")
+int fib_flow_keys_v6_icmp_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct ipv6hdr *l3;
+
+	pktgen__init(&builder, ctx);
+
+	l3 = pktgen__push_ipv6_packet(&builder,
+				      (__u8 *)mac_one, (__u8 *)mac_two,
+				      (__u8 *)v6_pod_one, (__u8 *)v6_pod_two);
+	if (!l3)
+		return TEST_ERROR;
+
+	if (!pktgen__push_icmp6hdr(&builder))
+		return TEST_ERROR;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+CHECK(PROG_TYPE, "fib_flow_keys_v6_icmp")
+int fib_flow_keys_v6_icmp_check(struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
+	int oif = 0;
+	__s8 ext_err;
+
+	test_init();
+
+	TEST("no_ports_no_synth", {
+		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+			test_fatal("packet too short");
+
+		reset_fib_lookup_recorder(&fib_lookup_recorder);
+		fib_redirect_v6(ctx, ETH_HLEN, ip6, false, true, &ext_err, &oif, 0);
+
+		if (fib_lookup_recorder.l4_protocol)
+			test_fatal("l4_protocol set for ICMPv6");
+		if (fib_lookup_recorder.sport || fib_lookup_recorder.dport)
+			test_fatal("ports set for ICMPv6");
+		if (fib_lookup_recorder.flowinfo)
+			test_fatal("label synthesized without ports");
+	});
+
+	test_finish();
+}
+
+PKTGEN(PROG_TYPE, "fib_flow_keys_v4_tcp")
+int fib_flow_keys_v4_tcp_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct tcphdr *l4;
+
+	pktgen__init(&builder, ctx);
+
+	l4 = pktgen__push_ipv4_tcp_packet(&builder,
+					  (__u8 *)mac_one, (__u8 *)mac_two,
+					  v4_pod_one, v4_pod_two,
+					  tcp_src_one, tcp_svc_one);
+	if (!l4)
+		return TEST_ERROR;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+CHECK(PROG_TYPE, "fib_flow_keys_v4_tcp")
+int fib_flow_keys_v4_tcp_check(struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	struct iphdr *ip4;
+	int oif = 0;
+	__s8 ext_err;
+
+	test_init();
+
+	TEST("ports_only", {
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			test_fatal("packet too short");
+
+		reset_fib_lookup_recorder(&fib_lookup_recorder);
+		fib_redirect_v4(ctx, ETH_HLEN, ip4, false, true, &ext_err, &oif, 0);
+
+		if (fib_lookup_recorder.l4_protocol != IPPROTO_TCP)
+			test_fatal("l4_protocol not TCP");
+		if (fib_lookup_recorder.sport != tcp_src_one)
+			test_fatal("sport not set");
+		if (fib_lookup_recorder.dport != tcp_svc_one)
+			test_fatal("dport not set");
+		if (fib_lookup_recorder.flowinfo)
+			test_fatal("flowinfo set for IPv4");
+	});
+
+	test_finish();
+}
+
+PKTGEN(PROG_TYPE, "fib_flow_keys_v4_frag")
+int fib_flow_keys_v4_frag_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct iphdr *l3;
+	struct tcphdr *l4;
+
+	pktgen__init(&builder, ctx);
+
+	l3 = pktgen__push_ipv4_packet(&builder,
+				      (__u8 *)mac_one, (__u8 *)mac_two,
+				      v4_pod_one, v4_pod_two);
+	if (!l3)
+		return TEST_ERROR;
+
+	/* Non-first fragment: the bytes after the IP header are payload,
+	 * not an L4 header.
+	 */
+	l3->frag_off = bpf_htons(0x0002);
+
+	l4 = pktgen__push_default_tcphdr(&builder);
+	if (!l4)
+		return TEST_ERROR;
+
+	l4->source = tcp_src_one;
+	l4->dest = tcp_svc_one;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+CHECK(PROG_TYPE, "fib_flow_keys_v4_frag")
+int fib_flow_keys_v4_frag_check(struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	struct iphdr *ip4;
+	int oif = 0;
+	__s8 ext_err;
+
+	test_init();
+
+	TEST("later_fragment_skipped", {
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			test_fatal("packet too short");
+
+		reset_fib_lookup_recorder(&fib_lookup_recorder);
+		fib_redirect_v4(ctx, ETH_HLEN, ip4, false, true, &ext_err, &oif, 0);
+
+		if (fib_lookup_recorder.l4_protocol)
+			test_fatal("l4_protocol set for a later fragment");
+		if (fib_lookup_recorder.sport || fib_lookup_recorder.dport)
+			test_fatal("payload bytes read as ports");
+	});
+
+	test_finish();
+}
+
+PKTGEN(PROG_TYPE, "fib_flow_keys_dispatch")
+int fib_flow_keys_dispatch_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct udphdr *l4;
+
+	pktgen__init(&builder, ctx);
+
+	l4 = pktgen__push_ipv4_udp_packet(&builder,
+					  (__u8 *)mac_one, (__u8 *)mac_two,
+					  v4_pod_one, v4_pod_two,
+					  tcp_src_one, tcp_svc_one);
+	if (!l4)
+		return TEST_ERROR;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+CHECK(PROG_TYPE, "fib_flow_keys_dispatch")
+int fib_flow_keys_dispatch_check(struct __ctx_buff *ctx)
+{
+	test_init();
+
+	TEST("family_dispatch", {
+		struct bpf_fib_lookup_padded params = {0};
+
+		params.l.family = AF_INET;
+		fib_params_set_l4(&params, ctx, ETH_HLEN);
+
+		if (params.l.l4_protocol != IPPROTO_UDP)
+			test_fatal("l4_protocol not UDP");
+		if (params.l.sport != tcp_src_one)
+			test_fatal("sport not set");
+		if (params.l.dport != tcp_svc_one)
+			test_fatal("dport not set");
 	});
 
 	test_finish();
