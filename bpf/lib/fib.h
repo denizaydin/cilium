@@ -248,28 +248,40 @@ fib_lookup_src_v6(struct __ctx_buff *ctx, struct in6_addr *src,
  * FIB can select a per-flow nexthop. Lookup input only; the packet is
  * not modified. When the packet carries no flow label, derive one from
  * the ports so the default L3 hash policy can also spread flows.
+ *
+ * fib_params_set_flow_v6 takes the 5-tuple from the caller, for lookups
+ * that describe a packet other than the one in the buffer - the
+ * post-RevNAT one, say. flowinfo is the packet's first word.
  */
+static __always_inline void
+fib_params_set_flow_v6(struct bpf_fib_lookup_padded *fib_params, __be32 flowinfo,
+		       __u8 proto, __be16 sport, __be16 dport)
+{
+	fib_params->l.l4_protocol = proto;
+	fib_params->l.sport = sport;
+	fib_params->l.dport = dport;
+
+	flowinfo &= IPV6_FLOWLABEL_MASK;
+	if (!flowinfo)
+		flowinfo = bpf_htonl(jhash_2words(sport, dport, JHASH_INITVAL)) &
+			   IPV6_FLOWLABEL_MASK;
+
+	fib_params->l.flowinfo = flowinfo;
+}
+
 static __always_inline void
 fib_params_set_l4_v6(struct bpf_fib_lookup_padded *fib_params,
 		     struct __ctx_buff *ctx, const struct ipv6hdr *ip6,
 		     int l3_off)
 {
-	__be32 flowinfo = *(const __be32 *)ip6 & IPV6_FLOWLABEL_MASK;
 	__be16 ports[2];
 
 	if (l4_proto_has_ports(ip6->nexthdr) &&
-	    l4_load_ports(ctx, l3_off + sizeof(struct ipv6hdr), ports) == 0) {
-		fib_params->l.l4_protocol = ip6->nexthdr;
-		fib_params->l.sport = ports[0];
-		fib_params->l.dport = ports[1];
-
-		if (!flowinfo)
-			flowinfo = bpf_htonl(jhash_2words(ports[0], ports[1],
-							  JHASH_INITVAL)) &
-				   IPV6_FLOWLABEL_MASK;
-	}
-
-	fib_params->l.flowinfo = flowinfo;
+	    l4_load_ports(ctx, l3_off + sizeof(struct ipv6hdr), ports) == 0)
+		fib_params_set_flow_v6(fib_params, *(const __be32 *)ip6,
+				       ip6->nexthdr, ports[0], ports[1]);
+	else
+		fib_params->l.flowinfo = *(const __be32 *)ip6 & IPV6_FLOWLABEL_MASK;
 }
 
 static __always_inline int
