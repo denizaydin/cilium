@@ -72,10 +72,31 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 ASSIGN_CONFIG(bool, enable_bpf_host_routing, true)
 ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
 
+/* The revDNAT lookup in to-netdev has to carry the post-RevDNAT flow
+ * keys: on a multipath route an L3-only lookup pins every reply to the
+ * same client onto one nexthop. IPv6 also needs a flow label, which the
+ * reply from the backend does not carry here.
+ */
+struct fib_lookup_recorder {
+	__u8 l4_protocol;
+	__be16 sport;
+	__be16 dport;
+	__be32 flowinfo;
+} fib_lookup_recorder = {0};
+
 long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
 		     __maybe_unused int plen, __maybe_unused __u32 flags)
 {
+	union v6addr frontend_ip = FRONTEND_IP;
+
 	params->ifindex = DEFAULT_IFACE;
+
+	if (ipv6_addr_equals((union v6addr *)params->ipv6_src, &frontend_ip)) {
+		fib_lookup_recorder.l4_protocol = params->l4_protocol;
+		fib_lookup_recorder.sport = params->sport;
+		fib_lookup_recorder.dport = params->dport;
+		fib_lookup_recorder.flowinfo = params->flowinfo;
+	}
 
 	return BPF_FIB_LKUP_RET_SUCCESS;
 }
@@ -352,6 +373,17 @@ int check_reply(const struct __ctx_buff *ctx)
 
 	if (l4->check != bpf_htons(0x8d5c))
 		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_ntohs(0x8d5c));
+
+	if (fib_lookup_recorder.l4_protocol != IPPROTO_TCP)
+		test_fatal("revDNAT FIB lookup carries no L4 protocol");
+	if (fib_lookup_recorder.sport != FRONTEND_PORT)
+		test_fatal("revDNAT FIB lookup sport is not the frontend port");
+	if (fib_lookup_recorder.dport != CLIENT_PORT)
+		test_fatal("revDNAT FIB lookup dport is not the client port");
+	if (fib_lookup_recorder.flowinfo !=
+	    (bpf_htonl(jhash_2words(FRONTEND_PORT, CLIENT_PORT, JHASH_INITVAL)) &
+	     IPV6_FLOWLABEL_MASK))
+		test_fatal("revDNAT FIB lookup flow label is not synthesized from the ports");
 
 	test_finish();
 }

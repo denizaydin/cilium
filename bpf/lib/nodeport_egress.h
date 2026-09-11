@@ -205,6 +205,13 @@ nodeport_rev_dnat_fwd_ipv6(struct __ctx_buff *ctx, bool *snat_done,
 		       &nat_info.address);
 	ipv6_addr_copy((union v6addr *)fib_params.l.ipv6_dst,
 		       &tuple.daddr);
+	/* The flow keys the wire will carry: the frontend port as source,
+	 * the client's port as destination. With only the addresses, a
+	 * multipath route hashes every reply to the same client onto one
+	 * nexthop.
+	 */
+	fib_params_set_flow_v6(&fib_params, *(__be32 *)ip6, tuple.nexthdr,
+			       nat_info.port, tuple.sport);
 
 	ret = nodeport_fib_lookup_and_redirect(ctx, &fib_params, ext_err);
 	if (ret != CTX_ACT_OK)
@@ -525,6 +532,14 @@ nodeport_rev_dnat_fwd_ipv4(struct __ctx_buff *ctx, bool *snat_done,
 	fib_params.l.ifindex = ctx_get_ifindex(ctx);
 	fib_params.l.ipv4_src = nat_info.address;
 	fib_params.l.ipv4_dst = tuple.daddr;
+	/* The flow keys the wire will carry: the frontend port as source,
+	 * the client's port as destination. With only the addresses, a
+	 * multipath route hashes every reply to the same client onto one
+	 * nexthop.
+	 */
+	fib_params.l.l4_protocol = tuple.nexthdr;
+	fib_params.l.sport = nat_info.port;
+	fib_params.l.dport = tuple.sport;
 
 	ret = nodeport_fib_lookup_and_redirect(ctx, &fib_params, ext_err);
 	if (ret != CTX_ACT_OK)
